@@ -25,7 +25,6 @@ class PrivateChatScreen extends StatefulWidget {
 class _PrivateChatScreenState extends State<PrivateChatScreen> {
   final TextEditingController messageController = TextEditingController();
 
-
   List<Map<String, dynamic>> messages = [];
   WebSocketChannel? channel;
   String? conversationId;
@@ -33,6 +32,10 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
   bool isLoading = true;
   bool isSending = false;
   final myId = supabase.auth.currentUser!.id;
+
+  // Key cache: tracks fetched keys. null value = fetch attempted but key missing.
+  // Use containsKey() to distinguish "not yet fetched" from "fetched but null".
+  final Map<String, String?> _keyCache = {};
 
   @override
   void initState() {
@@ -44,6 +47,9 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
     try {
       // Fetch recipient's public key — needed for encryption
       recipientPublicKey = await EncryptionService.getPublicKey(widget.recipientId);
+
+      // Pre-populate cache with recipient key (even if null)
+      _keyCache[widget.recipientId] = recipientPublicKey;
 
       if (recipientPublicKey == null) {
         if (mounted) {
@@ -65,8 +71,6 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
         conversationId = widget.existingConversationId;
         await loadMessageHistory();
       }
-      // Otherwise create a new conversation via WebSocket
-      // The conversation_created response will trigger history load
 
       if (mounted) setState(() => isLoading = false);
     } catch (e) {
@@ -95,7 +99,7 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
 
     // Listen for messages
     channel!.stream.listen(
-      (data) async {
+          (data) async {
         final msg = jsonDecode(data);
 
         if (msg['type'] == 'connected') {
@@ -106,20 +110,13 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
               'with_user_id': widget.recipientId,
             }));
           }
-        }
-
-        else if (msg['type'] == 'conversation_created') {
+        } else if (msg['type'] == 'conversation_created') {
           conversationId = msg['conversation_id'];
           await loadMessageHistory();
-        }
-
-        else if (msg['type'] == 'private_message' &&
+        } else if (msg['type'] == 'private_message' &&
             msg['conversation_id'] == conversationId) {
-          // Decrypt incoming message
           await handleIncomingMessage(msg);
-        }
-
-        else if (msg['type'] == 'error') {
+        } else if (msg['type'] == 'error') {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(content: Text(msg['message'] ?? 'Server error')),
@@ -131,6 +128,17 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
         debugPrint('WebSocket error: $error');
       },
     );
+  }
+
+  /// Fetches a public key with caching.
+  /// Uses containsKey() so we don't re-fetch keys that returned null.
+  Future<String?> _getCachedKey(String userId) async {
+    if (_keyCache.containsKey(userId)) {
+      return _keyCache[userId]; // already fetched (may be null)
+    }
+    final key = await EncryptionService.getPublicKey(userId);
+    _keyCache[userId] = key; // cache even if null
+    return key;
   }
 
   Future<void> loadMessageHistory() async {
@@ -146,18 +154,19 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
       List<Map<String, dynamic>> decryptedMessages = [];
 
       for (final msg in msgs) {
+        final senderId = msg['sender_id'] as String;
         try {
           String decryptedContent;
 
-          if (msg['sender_id'] == myId) {
-            // Our own message — decrypt with recipient's public key
+          if (senderId == myId) {
+            // Own message — was encrypted with recipient's public key
             decryptedContent = await EncryptionService.decryptMessage(
               msg['encrypted_content'],
               recipientPublicKey!,
             );
           } else {
-            // Their message — decrypt with sender's public key
-            final senderKey = await EncryptionService.getPublicKey(msg['sender_id']);
+            // Their message — decrypt using sender's public key
+            final senderKey = await _getCachedKey(senderId);
             if (senderKey == null) {
               decryptedContent = '[Unable to decrypt]';
             } else {
@@ -170,23 +179,21 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
 
           decryptedMessages.add({
             'content': decryptedContent,
-            'sender_id': msg['sender_id'],
+            'sender_id': senderId,
             'created_at': msg['created_at'],
-            'isMe': msg['sender_id'] == myId,
+            'isMe': senderId == myId,
           });
         } catch (e) {
           decryptedMessages.add({
             'content': '[Unable to decrypt message]',
-            'sender_id': msg['sender_id'],
+            'sender_id': senderId,
             'created_at': msg['created_at'],
-            'isMe': msg['sender_id'] == myId,
+            'isMe': senderId == myId,
           });
         }
       }
 
-      if (mounted) {
-        setState(() => messages = decryptedMessages);
-      }
+      if (mounted) setState(() => messages = decryptedMessages);
     } catch (e) {
       debugPrint('Failed to load message history: $e');
     }
@@ -194,8 +201,18 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
 
   Future<void> handleIncomingMessage(Map<String, dynamic> msg) async {
     try {
-      final senderKey = await EncryptionService.getPublicKey(msg['sender_id']);
-      if (senderKey == null) return;
+      final senderId = msg['sender_id'] as String;
+      final senderKey = await _getCachedKey(senderId);
+
+      debugPrint('sender_id: $senderId');
+      debugPrint('senderKey: $senderKey');
+      debugPrint('myId: $myId');
+      debugPrint('recipientId: ${widget.recipientId}');
+
+      if (senderKey == null) {
+        debugPrint('KEY IS NULL — cannot decrypt');
+        return;
+      }
 
       final decrypted = await EncryptionService.decryptMessage(
         msg['encrypted_content'],
@@ -206,7 +223,7 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
         setState(() {
           messages.insert(0, {
             'content': decrypted,
-            'sender_id': msg['sender_id'],
+            'sender_id': senderId,
             'created_at': msg['created_at'],
             'isMe': false,
           });
@@ -238,20 +255,17 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
     setState(() => isSending = true);
 
     try {
-      // Encrypt before sending
       final encryptedContent = await EncryptionService.encryptMessage(
         text,
         recipientPublicKey!,
       );
 
-      // Send via WebSocket
       channel?.sink.add(jsonEncode({
         'type': 'private_message',
         'conversation_id': conversationId,
         'encrypted_content': encryptedContent,
       }));
 
-      // Add to local messages immediately (optimistic update)
       setState(() {
         messages.insert(0, {
           'content': text,
@@ -261,7 +275,6 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
         });
         isSending = false;
       });
-
     } catch (e) {
       setState(() => isSending = false);
       if (mounted) {
@@ -306,9 +319,7 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
                 ),
               ),
             ),
-
             SizedBox(width: 10.w),
-
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -316,7 +327,6 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
                   widget.recipientUsername,
                   style: TextStyle(fontSize: 15.sp),
                 ),
-
                 Row(
                   children: [
                     Icon(
@@ -324,9 +334,7 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
                       size: 10.sp,
                       color: Colors.greenAccent,
                     ),
-
                     SizedBox(width: 3.w),
-
                     Text(
                       "End-to-end encrypted",
                       style: TextStyle(
@@ -340,7 +348,6 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
             ),
           ],
         ),
-
         actions: [
           Padding(
             padding: EdgeInsets.only(right: 12.w),
@@ -356,144 +363,146 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
       body: isLoading
           ? const Center(child: CircularProgressIndicator())
           : Column(
+        children: [
+          // Encryption notice banner
+          Container(
+            width: double.infinity,
+            padding: EdgeInsets.symmetric(vertical: 6.h),
+            color: Colors.green.withValues(alpha: 0.1),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                // Encryption notice banner
-                Container(
-                  width: double.infinity,
-                  padding: EdgeInsets.symmetric(vertical: 6.h),
-                  color: Colors.green.withValues(alpha: 0.1),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(Icons.lock, size: 12.sp, color: Colors.green),
-                      SizedBox(width: 4.w),
-                      Text(
-                        "Messages are end-to-end encrypted",
-                        style: TextStyle(
-                          fontSize: 11.sp,
-                          color: Colors.green,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-
-                // Messages list
-                Expanded(
-                  child: messages.isEmpty
-                      ? Center(
-                          child: Text(
-                            "No messages yet. Say hi! 👋",
-                            style: TextStyle(
-                              color: Colors.grey,
-                              fontSize: 14.sp,
-                            ),
-                          ),
-                        )
-                      : ListView.builder(
-                          reverse: true,
-                          padding: EdgeInsets.all(12.w),
-                          itemCount: messages.length,
-                          itemBuilder: (context, index) {
-                            final msg = messages[index];
-                            final isMe = msg['isMe'] as bool;
-
-                            return Align(
-                              alignment: isMe
-                                  ? Alignment.centerRight
-                                  : Alignment.centerLeft,
-                              child: Container(
-                                margin: EdgeInsets.only(bottom: 10.h),
-                                constraints: BoxConstraints(
-                                  maxWidth: MediaQuery.of(context).size.width * 0.75,
-                                ),
-                                padding: EdgeInsets.symmetric(
-                                  horizontal: 14.w,
-                                  vertical: 10.h,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: isMe
-                                      ? AppColors.primaryOrange
-                                      : (isDark
-                                          ? Colors.white10
-                                          : Colors.grey[200]),
-                                  borderRadius: BorderRadius.only(
-                                    topLeft: Radius.circular(15.r),
-                                    topRight: Radius.circular(15.r),
-                                    bottomLeft: isMe
-                                        ? Radius.circular(15.r)
-                                        : Radius.circular(4.r),
-                                    bottomRight: isMe
-                                        ? Radius.circular(4.r)
-                                        : Radius.circular(15.r),
-                                  ),
-                                ),
-                                child: Column(
-                                  crossAxisAlignment: isMe
-                                      ? CrossAxisAlignment.end
-                                      : CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      msg['content'],
-                                      style: TextStyle(
-                                        color: isMe ? Colors.white : null,
-                                        fontSize: 14.sp,
-                                      ),
-                                    ),
-                                    SizedBox(height: 4.h),
-                                    Text(
-                                      formatTime(msg['created_at']),
-                                      style: TextStyle(
-                                        fontSize: 10.sp,
-                                        color: isMe
-                                            ? Colors.white70
-                                            : Colors.grey,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                ),
-
-                // Input bar
-                Padding(
-                  padding: EdgeInsets.all(10.w),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: messageController,
-                          maxLines: null,
-                          decoration: InputDecoration(
-                            hintText: "Type a message...",
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(20.r),
-                            ),
-                          ),
-                          onSubmitted: (_) => sendMessage(),
-                        ),
-                      ),
-                      SizedBox(width: 8.w),
-                      isSending
-                          ? Padding(
-                              padding: EdgeInsets.all(8.w),
-                              child: const CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : IconButton(
-                              onPressed: sendMessage,
-                              icon: const Icon(
-                                Icons.send,
-                                color: AppColors.primaryOrange,
-                              ),
-                            ),
-                    ],
+                Icon(Icons.lock, size: 12.sp, color: Colors.green),
+                SizedBox(width: 4.w),
+                Text(
+                  "Messages are end-to-end encrypted",
+                  style: TextStyle(
+                    fontSize: 11.sp,
+                    color: Colors.green,
                   ),
                 ),
               ],
             ),
+          ),
+
+          // Messages list
+          Expanded(
+            child: messages.isEmpty
+                ? Center(
+              child: Text(
+                "No messages yet. Say hi! 👋",
+                style: TextStyle(
+                  color: Colors.grey,
+                  fontSize: 14.sp,
+                ),
+              ),
+            )
+                : ListView.builder(
+              reverse: true,
+              padding: EdgeInsets.all(12.w),
+              itemCount: messages.length,
+              itemBuilder: (context, index) {
+                final msg = messages[index];
+                final isMe = msg['isMe'] as bool;
+
+                return Align(
+                  alignment: isMe
+                      ? Alignment.centerRight
+                      : Alignment.centerLeft,
+                  child: Container(
+                    margin: EdgeInsets.only(bottom: 10.h),
+                    constraints: BoxConstraints(
+                      maxWidth:
+                      MediaQuery.of(context).size.width * 0.75,
+                    ),
+                    padding: EdgeInsets.symmetric(
+                      horizontal: 14.w,
+                      vertical: 10.h,
+                    ),
+                    decoration: BoxDecoration(
+                      color: isMe
+                          ? AppColors.primaryOrange
+                          : (isDark
+                          ? Colors.white10
+                          : Colors.grey[200]),
+                      borderRadius: BorderRadius.only(
+                        topLeft: Radius.circular(15.r),
+                        topRight: Radius.circular(15.r),
+                        bottomLeft: isMe
+                            ? Radius.circular(15.r)
+                            : Radius.circular(4.r),
+                        bottomRight: isMe
+                            ? Radius.circular(4.r)
+                            : Radius.circular(15.r),
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: isMe
+                          ? CrossAxisAlignment.end
+                          : CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          msg['content'],
+                          style: TextStyle(
+                            color: isMe ? Colors.white : null,
+                            fontSize: 14.sp,
+                          ),
+                        ),
+                        SizedBox(height: 4.h),
+                        Text(
+                          formatTime(msg['created_at']),
+                          style: TextStyle(
+                            fontSize: 10.sp,
+                            color: isMe
+                                ? Colors.white70
+                                : Colors.grey,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+
+          // Input bar
+          Padding(
+            padding: EdgeInsets.all(10.w),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: messageController,
+                    maxLines: null,
+                    decoration: InputDecoration(
+                      hintText: "Type a message...",
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(20.r),
+                      ),
+                    ),
+                    onSubmitted: (_) => sendMessage(),
+                  ),
+                ),
+                SizedBox(width: 8.w),
+                isSending
+                    ? Padding(
+                  padding: EdgeInsets.all(8.w),
+                  child: const CircularProgressIndicator(
+                      strokeWidth: 2),
+                )
+                    : IconButton(
+                  onPressed: sendMessage,
+                  icon: const Icon(
+                    Icons.send,
+                    color: AppColors.primaryOrange,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

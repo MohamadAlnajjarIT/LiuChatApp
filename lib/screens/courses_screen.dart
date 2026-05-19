@@ -27,14 +27,37 @@ class _CoursesScreenState extends State<CoursesScreen> {
     fetchCourses();
   }
 
+
   Future<void> fetchCourses() async {
     try {
+      debugPrint("START FETCH");
+
+      final majorCourses = await supabase
+          .from('major_courses')
+          .select('course_id')
+          .eq('major_id', widget.majorId);
+
+      debugPrint("MAJOR COURSES: $majorCourses");
+
+      final courseIds = majorCourses.map((r) => r['course_id']).toList();
+
+      debugPrint("COURSE IDS: $courseIds");
+
+      if (courseIds.isEmpty) {
+        debugPrint("NO COURSE IDS FOUND");
+
+        if (mounted) setState(() => isLoading = false);
+        return;
+      }
+
       final response = await supabase
           .from('groups')
           .select('id, name')
-          .eq('major_id', widget.majorId)
+          .inFilter('course_id', courseIds)
           .eq('is_general', false)
           .order('name');
+
+      debugPrint("GROUP RESPONSE: $response");
 
       if (mounted) {
         setState(() {
@@ -43,14 +66,18 @@ class _CoursesScreenState extends State<CoursesScreen> {
         });
       }
     } catch (e) {
+      debugPrint("FETCH ERROR: $e");
+
       if (mounted) {
         setState(() => isLoading = false);
+
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Failed to load courses")),
         );
       }
     }
   }
+
 
   @override
   Widget build(BuildContext context) {

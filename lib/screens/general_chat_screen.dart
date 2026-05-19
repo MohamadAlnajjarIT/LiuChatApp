@@ -159,7 +159,7 @@ class _GeneralChatScreenState extends State<GeneralChatScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text("${widget.majorName}"),
+        title: Text(widget.majorName),
 
         actions: [
           Padding(
